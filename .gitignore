@@ -1,0 +1,11 @@
+node_modules/
+.vscode/
+.idea/
+*.log
+dist/
+build/
+temp/
+*.gimple
+debug_prog.c
+debug_prog.exe
+debug_prog

@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>C Pointer Visualizer</title>
+    <meta name="description" content="Interactive tool to visualize C pointer relationships and memory layout">
+    <link rel="stylesheet" href="styles.css">
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap"
+        rel="stylesheet">
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">⚡</span>
+                <h1>C Pointer Visualizer</h1>
+            </div>
+            <p class="tagline">Understand pointers through visualization</p>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Left Panel - Code Input -->
+            <section class="panel code-panel">
+                <div class="panel-header">
+                    <h2>📝 C Code</h2>
+                    <div class="panel-actions">
+                        <label class="upload-btn" for="file-upload">
+                            <span class="btn-icon">📁</span> Upload
+                        </label>
+                        <input type="file" id="file-upload" accept=".c,.h" hidden>
+                        <select id="examples-dropdown" class="examples-dropdown">
+                            <option value="">Load Example...</option>
+                            <option value="basic">Basic Pointer</option>
+                            <option value="double">Double Pointer</option>
+                            <option value="array">Array & Pointer</option>
+                            <option value="struct">Struct Pointer</option>
+                            <option value="linked">Linked List</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="code-editor-container">
+                    <div class="line-numbers" id="line-numbers"></div>
+                    <textarea id="code-input" class="code-editor" placeholder="// Enter your C code here...
+int x = 10;
+int *p = &x;" spellcheck="false"></textarea>
+                </div>
+                <div class="panel-footer">
+                    <button id="analyze-btn" class="btn btn-primary">
+                        <span class="btn-icon">🔍</span> Analyze
+                    </button>
+                    <button id="debug-btn" class="btn btn-accent">
+                        <span class="btn-icon">🐛</span> Debug & Study
+                    </button>
+                    <button id="clear-btn" class="btn btn-secondary">
+                        <span class="btn-icon">🗑️</span> Clear
+                    </button>
+                </div>
+
+                <!-- Debug Toolbar (hidden by default) -->
+                <div class="debug-toolbar" id="debug-toolbar" style="display: none;">
+                    <div class="debug-toolbar-header">
+                        <span class="debug-status" id="debug-status">🔴 Not Running</span>
+                    </div>
+                    <div class="debug-buttons">
+                        <button id="debug-run" class="btn btn-small btn-success" title="Run (F5)">
+                            <span>▶</span> Run
+                        </button>
+                        <button id="debug-next" class="btn btn-small" title="Step Over (F10)" disabled>
+                            <span>⏭</span> Next
+                        </button>
+                        <button id="debug-step" class="btn btn-small" title="Step Into (F11)" disabled>
+                            <span>⏬</span> Step
+                        </button>
+                        <button id="debug-continue" class="btn btn-small" title="Continue (F8)" disabled>
+                            <span>▶▶</span> Continue
+                        </button>
+                        <button id="debug-stop" class="btn btn-small btn-danger" title="Stop (Shift+F5)" disabled>
+                            <span>⏹</span> Stop
+                        </button>
+                    </div>
+                    <div class="debug-info">
+                        <div class="debug-location" id="debug-location">📍 Ready</div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Divider -->
+            <div class="divider"></div>
+
+            <!-- Right Panel - Diagram -->
+            <section class="panel diagram-panel">
+                <div class="panel-header">
+                    <h2>📊 Pointer Diagram</h2>
+                    <div class="panel-actions">
+                        <button id="zoom-in" class="btn btn-icon-only" title="Zoom In">+</button>
+                        <button id="zoom-out" class="btn btn-icon-only" title="Zoom Out">−</button>
+                        <button id="reset-view" class="btn btn-icon-only" title="Reset View">⟲</button>
+                    </div>
+                </div>
+                <div class="diagram-container" id="diagram-container">
+                    <div class="diagram-placeholder" id="diagram-placeholder">
+                        <div class="placeholder-icon">🎯</div>
+                        <p>Enter C code and click <strong>Analyze</strong> to visualize pointers</p>
+                    </div>
+                    <svg id="diagram-svg" class="diagram-svg"></svg>
+                </div>
+                <div class="legend" id="legend">
+                    <div class="legend-item">
+                        <span class="legend-box legend-var"></span>
+                        <span>Variable</span>
+                    </div>
+                    <div class="legend-item">
+                        <span class="legend-box legend-ptr"></span>
+                        <span>Pointer</span>
+                    </div>
+                    <div class="legend-item">
+                        <span class="legend-arrow">→</span>
+                        <span>Points to</span>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Variables Panel (for debugging) -->
+        <aside class="variables-panel" id="variables-panel" style="display: none;">
+            <div class="variables-header">
+                <h3>🔍 Debug State</h3>
+                <button id="close-variables" class="btn-close">×</button>
+            </div>
+            <div class="variables-content">
+                <div class="stack-section">
+                    <h4>📚 Stack</h4>
+                    <div id="stack-frames"></div>
+                </div>
+                <div class="tabs">
+                    <button class="tab-btn active" data-tab="variables">Variables</button>
+                    <button class="tab-btn" data-tab="output">Output</button>
+                    <button class="tab-btn" data-tab="gdb">GDB Log</button>
+                    <button class="tab-btn" data-tab="gimple">GIMPLE IR</button>
+                </div>
+
+                <div id="tab-variables" class="tab-content active">
+                    <div class="locals-section">
+                        <table id="locals-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Type</th>
+                                    <th>Value</th>
+                                </tr>
+                            </thead>
+                            <tbody></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div id="tab-output" class="tab-content">
+                    <pre id="program-output"></pre>
+                </div>
+
+                <div id="tab-gdb" class="tab-content">
+                    <pre id="gdb-log"></pre>
+                </div>
+
+                <div id="tab-gimple" class="tab-content">
+                    <pre id="gimple-content"></pre>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Token Debug Panel (collapsed by default) -->
+        <aside class="debug-panel" id="debug-panel">
+            <button class="debug-toggle" id="debug-toggle">
+                🔧 Token Debug
+            </button>
+            <div class="debug-content" id="debug-content">
+                <pre id="token-output"></pre>
+            </div>
+        </aside>
+    </div>
+
+    <!-- Scripts -->
+    <!-- Tree-sitter for client-side C parsing -->
+    <script src="https://unpkg.com/web-tree-sitter@0.22.6/tree-sitter.js"></script>
+    <script src="tree-sitter-analyzer.js"></script>
+    <!-- Original analyzers (fallback) -->
+    <script src="tokenizer.js"></script>
+    <script src="analyzer.js"></script>
+    <script src="renderer.js"></script>
+    <script src="examples.js"></script>
+    <script src="app.js"></script>
+    <!-- Debugger UI -->
+    <script src="debugger-ui.js"></script>
+</body>
+
+</html>
