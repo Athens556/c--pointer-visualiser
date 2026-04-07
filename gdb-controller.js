@@ -17,6 +17,7 @@ class GDBController extends EventEmitter {
         this.isPaused = false;
         this.currentFile = null;
         this.currentLine = 0;
+        this.currentFrameArgs = [];
         this.tempDir = path.join(os.tmpdir(), 'c-visualizer-debug');
         this.buffer = '';
 
@@ -132,7 +133,15 @@ class GDBController extends EventEmitter {
     request(cmd) {
         return new Promise((resolve, reject) => {
             const token = ++this.tokenCounter;
-            this.pendingRequests.set(token, { resolve, reject });
+            this.pendingRequests.set(token, { resolve, reject, emitError: true });
+            this.sendCommand(`${token}${cmd}`);
+        });
+    }
+
+    requestQuiet(cmd) {
+        return new Promise((resolve, reject) => {
+            const token = ++this.tokenCounter;
+            this.pendingRequests.set(token, { resolve, reject, emitError: false });
             this.sendCommand(`${token}${cmd}`);
         });
     }
@@ -183,12 +192,23 @@ class GDBController extends EventEmitter {
         try {
             const res = await this.request('-stack-list-locals 2');
             const locals = this.parseLocals(res.locals);
+            const args = await this.getFrameArguments();
+            const variables = this.mergeVariables(args, locals);
+            const chainVariables = await this.buildStructChainVariables(variables);
+            const expandedVariables = this.mergeVariables(variables, chainVariables);
+            const dereferencedVariables = await this.buildDereferencedVariables(expandedVariables);
+            const allVariables = this.mergeVariables(expandedVariables, dereferencedVariables);
 
             // Enrich with addresses
-            for (const local of locals) {
+            for (const local of allVariables) {
                 // Get address of variable: &name
+                if (local.isDerivedDereference) {
+                    local.address = this.normalizeAddress(local.sourcePointerValue);
+                    continue;
+                }
+
                 try {
-                    const addrRes = await this.request(`-data-evaluate-expression "&${local.name}"`);
+                    const addrRes = await this.requestQuiet(`-data-evaluate-expression "&${local.name}"`);
                     // Result: value="0x..." or value="0x... <symbol>"
                     // Parse address
                     let addr = addrRes.value;
@@ -205,8 +225,8 @@ class GDBController extends EventEmitter {
                 }
             }
 
-            this.emit('locals', locals);
-            return locals;
+            this.emit('locals', allVariables);
+            return allVariables;
         } catch (e) {
             console.error('getLocals error:', e);
         }
@@ -223,6 +243,19 @@ class GDBController extends EventEmitter {
             return frames;
         } catch (e) {
             console.error('getStack error:', e);
+        }
+    }
+
+    async getFrameArguments() {
+        try {
+            const res = await this.requestQuiet('-stack-list-arguments 2 0 0');
+            const args = this.parseStackArguments(res['stack-args']);
+            if (args.length > 0) {
+                this.currentFrameArgs = args;
+            }
+            return args;
+        } catch (e) {
+            return this.currentFrameArgs || [];
         }
     }
 
@@ -316,23 +349,30 @@ class GDBController extends EventEmitter {
         else if (content.startsWith('^error')) {
             const data = this.parseMIData(content.substring(6));
             if (token && this.pendingRequests.has(token)) {
-                this.pendingRequests.get(token).reject(new Error(data.msg || 'GDB error'));
+                const pending = this.pendingRequests.get(token);
+                pending.reject(new Error(data.msg || 'GDB error'));
                 this.pendingRequests.delete(token);
+                if (pending.emitError !== false) {
+                    this.emit('error', data.msg || 'GDB error');
+                }
+            } else {
+                this.emit('error', data.msg || 'GDB error');
             }
-            this.emit('error', data.msg || 'GDB error');
         }
 
         // Async records (*stopped, *running) - these usually don't have tokens of their own
         else if (content.startsWith('*stopped')) {
             this.isPaused = true;
             const data = this.parseMIData(content.substring(8));
-            this.currentLine = parseInt(data.line) || 0;
-            this.currentFile = data.file || data.fullname;
+            const frame = this.parseStoppedFrame(content);
+            this.currentFrameArgs = this.parseArgs(frame.args, frame.level);
+            this.currentLine = parseInt(frame.line || data.line) || 0;
+            this.currentFile = frame.fullname || frame.file || data.fullname || data.file;
             this.emit('stopped', {
                 reason: data.reason,
                 line: this.currentLine,
                 file: this.currentFile,
-                frame: data.frame
+                frame
             });
 
             // Auto-fetch state unless we exited
@@ -374,27 +414,141 @@ class GDBController extends EventEmitter {
     parseMIData(str) {
         const result = {};
         if (!str || !str.startsWith(',')) return result;
-        str = str.substring(1);
+        const input = str.substring(1);
+        let i = 0;
 
-        const regex = /(\w+)=(?:"([^"\\]*(?:\\.[^"\\]*)*)"|{([^}]*)}|\[([^\]]*)\])/g;
-        let match;
-        while ((match = regex.exec(str)) !== null) {
-            const key = match[1];
-            const value = match[2] || match[3] || match[4] || '';
+        while (i < input.length) {
+            while (i < input.length && (input[i] === ',' || /\s/.test(input[i]))) i++;
+            if (i >= input.length) break;
+
+            let keyStart = i;
+            while (i < input.length && /[\w-]/.test(input[i])) i++;
+            const key = input.slice(keyStart, i);
+            if (!key || input[i] !== '=') {
+                while (i < input.length && input[i] !== ',') i++;
+                continue;
+            }
+
+            i++; // skip '='
+            const { value, nextIndex } = this.readMIValue(input, i);
             result[key] = value;
+            i = nextIndex;
         }
+
+        return result;
+    }
+
+    readMIValue(input, startIndex) {
+        if (startIndex >= input.length) {
+            return { value: '', nextIndex: startIndex };
+        }
+
+        const opener = input[startIndex];
+        if (opener === '"') {
+            let i = startIndex + 1;
+            let value = '';
+            while (i < input.length) {
+                const ch = input[i];
+                if (ch === '\\' && i + 1 < input.length) {
+                    value += ch + input[i + 1];
+                    i += 2;
+                    continue;
+                }
+                if (ch === '"') {
+                    return { value, nextIndex: i + 1 };
+                }
+                value += ch;
+                i++;
+            }
+            return { value, nextIndex: i };
+        }
+
+        if (opener === '{' || opener === '[') {
+            const closer = opener === '{' ? '}' : ']';
+            let depth = 1;
+            let i = startIndex + 1;
+            let value = '';
+            while (i < input.length && depth > 0) {
+                const ch = input[i];
+                if (ch === '\\' && i + 1 < input.length) {
+                    value += ch + input[i + 1];
+                    i += 2;
+                    continue;
+                }
+                if (ch === '"') {
+                    const quoted = this.readMIValue(input, i);
+                    value += `"${quoted.value}"`;
+                    i = quoted.nextIndex;
+                    continue;
+                }
+                if (ch === opener) depth++;
+                if (ch === closer) depth--;
+                if (depth > 0) value += ch;
+                i++;
+            }
+            return { value, nextIndex: i };
+        }
+
+        let i = startIndex;
+        let value = '';
+        while (i < input.length && input[i] !== ',') {
+            value += input[i];
+            i++;
+        }
+        return { value: value.trim(), nextIndex: i };
+    }
+
+    parseStoppedFrame(content) {
+        const match = content.match(/frame=\{([\s\S]*?)\},thread-id=/);
+        if (!match) return {};
+
+        const frameStr = match[1];
+        return {
+            level: this.extractField(frameStr, 'level'),
+            func: this.extractField(frameStr, 'func'),
+            file: this.extractField(frameStr, 'file'),
+            fullname: this.extractField(frameStr, 'fullname'),
+            line: this.extractField(frameStr, 'line'),
+            addr: this.extractField(frameStr, 'addr'),
+            arch: this.extractField(frameStr, 'arch'),
+            args: this.extractListField(frameStr, 'args')
+        };
+    }
+
+    extractField(source, key) {
+        const match = source.match(new RegExp(`${key}="([^"]*)"`, 'i'));
+        return match ? match[1] : '';
+    }
+
+    extractListField(source, key) {
+        const prefix = `${key}=[`;
+        const start = source.indexOf(prefix);
+        if (start === -1) return '';
+
+        let i = start + prefix.length;
+        let depth = 1;
+        let result = '';
+
+        while (i < source.length && depth > 0) {
+            const ch = source[i];
+            if (ch === '[') depth++;
+            if (ch === ']') depth--;
+            if (depth > 0) result += ch;
+            i++;
+        }
+
         return result;
     }
 
     parseLocals(localsStr) {
         const locals = [];
-        const varRegex = /\{name="([^"]+)",(?:type="([^"]+)",)?value="([^"]*)"\}/g;
+        const varRegex = /\{name="([^"]+)"(?:,type="([^"]+)")?(?:,value="([^"]*)")?\}/g;
         let match;
         while ((match = varRegex.exec(localsStr)) !== null) {
             const variable = {
                 name: match[1],
                 type: match[2] || 'unknown',
-                value: match[3]
+                value: match[3] ?? '(unavailable)'
             };
             // Initial pointer guess
             if (variable.type.includes('*') || variable.value.startsWith('0x')) {
@@ -403,6 +557,215 @@ class GDBController extends EventEmitter {
             locals.push(variable);
         }
         return locals;
+    }
+
+    parseArgs(argsStr, frameLevel = 0) {
+        if (!argsStr) return [];
+
+        const args = [];
+        const argRegex = /\{name="([^"]+)"(?:,type="([^"]+)")?(?:,value="([^"]*)")?\}/g;
+        let match;
+
+        while ((match = argRegex.exec(argsStr)) !== null) {
+            const value = match[3] ?? '(unavailable)';
+            args.push({
+                name: match[1],
+                type: match[2] || 'parameter',
+                value,
+                isPointer: value.startsWith('0x') && value !== '0x0',
+                isParameter: true,
+                frameLevel: parseInt(frameLevel) || 0
+            });
+        }
+
+        return args;
+    }
+
+    async buildDereferencedVariables(variables) {
+        const derived = [];
+
+        for (const variable of variables) {
+            const pointerLevel = this.getPointerLevel(variable.type);
+            if (pointerLevel <= 0) continue;
+
+            const displayName = variable.name.startsWith('*') ? variable.name : `*${variable.name}`;
+            let value = '(unavailable)';
+
+            try {
+                const res = await this.requestQuiet(`-data-evaluate-expression "*(${variable.name})"`);
+                value = res.value ?? '(unavailable)';
+            } catch (e) {
+                value = '(unavailable)';
+            }
+
+            derived.push({
+                name: displayName,
+                type: this.stripOnePointerLevel(variable.type),
+                value,
+                isPointer: pointerLevel > 1 || (typeof value === 'string' && value.startsWith('0x') && value !== '0x0'),
+                isDerivedDereference: true,
+                sourceName: variable.name,
+                sourcePointerValue: variable.value,
+                derivedDepth: (variable.derivedDepth || 0) + 1
+            });
+        }
+
+        return derived;
+    }
+
+    async buildStructChainVariables(variables) {
+        const derived = [];
+        const visitedAddresses = new Set();
+
+        for (const variable of variables) {
+            if (!variable.type?.includes('struct') || this.getPointerLevel(variable.type) <= 0) {
+                continue;
+            }
+
+            let expr = variable.name;
+            let exprType = variable.type;
+            let depth = 1;
+
+            while (depth <= 8) {
+                const derefValue = await this.safeEvaluate(`*(${expr})`);
+                if (!derefValue || !derefValue.startsWith('{')) break;
+
+                const fields = this.parseStructFields(derefValue);
+                if (fields.length === 0) break;
+
+                let nextExpr = null;
+                let nextPointerType = this.stripOnePointerLevel(exprType);
+
+                for (const field of fields) {
+                    const fieldExpr = `${expr}->${field.name}`;
+                    const fieldType = this.inferFieldType(field.value, nextPointerType);
+                    derived.push({
+                        name: fieldExpr,
+                        type: fieldType,
+                        value: field.value,
+                        isPointer: this.looksLikePointer(field.value),
+                        isDerivedDereference: true,
+                        sourceName: expr,
+                        sourcePointerValue: field.value,
+                        derivedDepth: depth
+                    });
+
+                    if (!nextExpr && this.looksLikePointer(field.value) && field.value !== '0x0') {
+                        nextExpr = fieldExpr;
+                    }
+                }
+
+                if (!nextExpr) break;
+
+                const nextAddressValue = derived.find(item => item.name === nextExpr)?.value;
+                const normalizedAddress = this.normalizeAddress(nextAddressValue);
+                if (!normalizedAddress || visitedAddresses.has(normalizedAddress)) break;
+
+                visitedAddresses.add(normalizedAddress);
+                expr = nextExpr;
+                exprType = nextPointerType;
+                depth++;
+            }
+        }
+
+        return derived;
+    }
+
+    getPointerLevel(type = '') {
+        return (type.match(/\*/g) || []).length;
+    }
+
+    stripOnePointerLevel(type = '') {
+        return type.replace(/\s*\*$/, '').trim() || type;
+    }
+
+    normalizeAddress(value) {
+        if (!value || typeof value !== 'string') return null;
+        const trimmed = value.trim();
+        if (!trimmed.startsWith('0x')) return null;
+        return trimmed.split(' ')[0];
+    }
+
+    looksLikePointer(value) {
+        return typeof value === 'string' && value.trim().startsWith('0x');
+    }
+
+    async safeEvaluate(expr) {
+        try {
+            const res = await this.requestQuiet(`-data-evaluate-expression "${expr}"`);
+            return res.value ?? '';
+        } catch (e) {
+            return '';
+        }
+    }
+
+    parseStructFields(structValue) {
+        const trimmed = (structValue || '').trim();
+        if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return [];
+
+        const inner = trimmed.slice(1, -1);
+        const fields = [];
+        let current = '';
+        let braceDepth = 0;
+
+        for (let i = 0; i < inner.length; i++) {
+            const ch = inner[i];
+            if (ch === '{') braceDepth++;
+            if (ch === '}') braceDepth--;
+
+            if (ch === ',' && braceDepth === 0) {
+                if (current.trim()) fields.push(current.trim());
+                current = '';
+                continue;
+            }
+
+            current += ch;
+        }
+
+        if (current.trim()) fields.push(current.trim());
+
+        return fields.map((field) => {
+            const parts = field.split(/\s*=\s*/);
+            return {
+                name: parts[0]?.trim(),
+                value: parts.slice(1).join(' = ').trim()
+            };
+        }).filter(field => field.name);
+    }
+
+    inferFieldType(value, fallbackStructType) {
+        if (this.looksLikePointer(value)) {
+            return `${fallbackStructType} *`;
+        }
+        if (/^-?\d+$/.test(value)) {
+            return 'int';
+        }
+        if (value.startsWith('{')) {
+            return fallbackStructType;
+        }
+        return 'field';
+    }
+
+    parseStackArguments(stackArgsStr) {
+        if (!stackArgsStr) return [];
+
+        const frameMatch = stackArgsStr.match(/frame=\{[^]*?args=\[([\s\S]*)\]\s*\}?$/);
+        if (!frameMatch) return [];
+
+        return this.parseArgs(frameMatch[1], 0);
+    }
+
+    mergeVariables(args, locals) {
+        const merged = [];
+        const seen = new Set();
+
+        for (const variable of [...(args || []), ...(locals || [])]) {
+            if (!variable?.name || seen.has(variable.name)) continue;
+            seen.add(variable.name);
+            merged.push(variable);
+        }
+
+        return merged;
     }
 
     parseStack(stackStr) {

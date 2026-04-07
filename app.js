@@ -4,70 +4,168 @@
  */
 
 document.addEventListener('DOMContentLoaded', () => {
-    // DOM Elements
     const codeInput = document.getElementById('code-input');
-    const lineNumbers = document.getElementById('line-numbers');
+    const monacoHost = document.getElementById('monaco-editor');
     const analyzeBtn = document.getElementById('analyze-btn');
+    const debugBtn = document.getElementById('debug-btn');
     const clearBtn = document.getElementById('clear-btn');
     const fileUpload = document.getElementById('file-upload');
     const examplesDropdown = document.getElementById('examples-dropdown');
-    const diagramSvg = document.getElementById('diagram-svg');
+    const visualizationMode = document.getElementById('visualization-mode');
+    const diagramCanvas = document.getElementById('diagram-canvas');
     const placeholder = document.getElementById('diagram-placeholder');
     const legend = document.getElementById('legend');
     const debugToggle = document.getElementById('debug-toggle');
     const debugPanel = document.getElementById('debug-panel');
-    const debugContent = document.getElementById('debug-content');
     const tokenOutput = document.getElementById('token-output');
     const zoomInBtn = document.getElementById('zoom-in');
     const zoomOutBtn = document.getElementById('zoom-out');
     const resetViewBtn = document.getElementById('reset-view');
 
-    // Initialize components
+    const ANALYSIS_MODES = {
+        STATIC: 'static',
+        GIMPLE: 'gimple',
+        GDB: 'gdb'
+    };
+
     const tokenizer = new CTokenizer();
     const analyzer = new CPointerAnalyzer();
-    const renderer = new DiagramRenderer(diagramSvg);
-    window.renderer = renderer; // Expose for debugger UI
+    const renderer = new DiagramRenderer(diagramCanvas);
+    window.renderer = renderer;
 
-    // Update line numbers
-    function updateLineNumbers() {
-        const lines = codeInput.value.split('\n');
-        lineNumbers.innerHTML = lines.map((_, i) => `<div>${i + 1}</div>`).join('');
+    let monacoEditor = null;
+    let monacoDecorations = [];
+    let breakpointDecorations = [];
+    let lastAnalysis = null;
+
+    function getSelectedMode() {
+        return visualizationMode?.value || ANALYSIS_MODES.STATIC;
     }
 
-    // Sync scroll between editor and line numbers
-    codeInput.addEventListener('scroll', () => {
-        lineNumbers.scrollTop = codeInput.scrollTop;
-    });
+    function getCode() {
+        return monacoEditor ? monacoEditor.getValue() : codeInput.value;
+    }
 
-    // Update line numbers on input
-    codeInput.addEventListener('input', updateLineNumbers);
-
-    // Handle Tab key - insert spaces instead of moving focus
-    codeInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Tab') {
-            e.preventDefault();
-            const start = codeInput.selectionStart;
-            const end = codeInput.selectionEnd;
-            const spaces = '    '; // 4 spaces for tab
-
-            // Insert tab at cursor position
-            codeInput.value = codeInput.value.substring(0, start) + spaces + codeInput.value.substring(end);
-
-            // Move cursor after the inserted spaces
-            codeInput.selectionStart = codeInput.selectionEnd = start + spaces.length;
-
-            updateLineNumbers();
+    function setCode(value) {
+        codeInput.value = value;
+        if (monacoEditor && monacoEditor.getValue() !== value) {
+            monacoEditor.setValue(value);
         }
-    });
+    }
 
-    // Initial line numbers
-    updateLineNumbers();
+    function setAnalyzeButtonState(isBusy) {
+        analyzeBtn.disabled = isBusy;
+        if (isBusy) {
+            analyzeBtn.innerHTML = '<span class="btn-icon">...</span> Working...';
+            return;
+        }
 
-    // Tree-sitter analyzer (client-side)
+        if (getSelectedMode() === ANALYSIS_MODES.GDB) {
+            analyzeBtn.innerHTML = '<span class="btn-icon">GDB</span> Start Debug Session';
+        } else {
+            analyzeBtn.innerHTML = '<span class="btn-icon">Run</span> Analyze';
+        }
+    }
+
+    function syncModeUI() {
+        const isGdbMode = getSelectedMode() === ANALYSIS_MODES.GDB;
+        debugBtn.style.display = isGdbMode ? 'flex' : 'none';
+        setAnalyzeButtonState(false);
+    }
+
+    function createEditorBridge() {
+        window.codeEditorBridge = {
+            getValue: () => getCode(),
+            setValue: (value) => setCode(value),
+            focus: () => monacoEditor?.focus(),
+            highlightLine: (lineNumber) => {
+                if (!monacoEditor) return;
+                monacoDecorations = monacoEditor.deltaDecorations(monacoDecorations, [{
+                    range: new monaco.Range(lineNumber, 1, lineNumber, 1),
+                    options: {
+                        isWholeLine: true,
+                        className: 'monaco-current-line',
+                        glyphMarginClassName: 'monaco-current-line-glyph'
+                    }
+                }]);
+                monacoEditor.revealLineInCenter(lineNumber);
+            },
+            clearHighlight: () => {
+                if (!monacoEditor) return;
+                monacoDecorations = monacoEditor.deltaDecorations(monacoDecorations, []);
+            },
+            renderBreakpoints: (breakpoints) => {
+                if (!monacoEditor) return;
+                breakpointDecorations = monacoEditor.deltaDecorations(
+                    breakpointDecorations,
+                    Array.from(breakpoints || []).map(line => ({
+                        range: new monaco.Range(line, 1, line, 1),
+                        options: {
+                            isWholeLine: true,
+                            glyphMarginClassName: 'monaco-breakpoint-glyph'
+                        }
+                    }))
+                );
+            }
+        };
+    }
+
+    async function initMonacoEditor() {
+        await new Promise((resolve, reject) => {
+            if (!window.require) {
+                reject(new Error('Monaco loader not available'));
+                return;
+            }
+
+            window.require.config({
+                paths: {
+                    vs: '/node_modules/monaco-editor/min/vs'
+                }
+            });
+
+            window.require(['vs/editor/editor.main'], resolve, reject);
+        });
+
+        monacoEditor = monaco.editor.create(monacoHost, {
+            value: codeInput.value,
+            language: 'cpp',
+            theme: 'vs-dark',
+            automaticLayout: true,
+            minimap: { enabled: false },
+            glyphMargin: true,
+            roundedSelection: false,
+            scrollBeyondLastLine: false,
+            tabSize: 4,
+            insertSpaces: true,
+            fontFamily: 'JetBrains Mono',
+            fontSize: 14,
+            lineHeight: 24
+        });
+
+        monacoEditor.onDidChangeModelContent(() => {
+            codeInput.value = monacoEditor.getValue();
+        });
+
+        monacoEditor.onMouseDown((event) => {
+            if (event.target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) {
+                const lineNumber = event.target.position?.lineNumber;
+                if (lineNumber) {
+                    window.debuggerUI?.toggleBreakpoint(lineNumber);
+                }
+            }
+        });
+
+        monacoEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
+            analyzeCode();
+        });
+
+        createEditorBridge();
+        window.debuggerUI?.renderBreakpoints();
+    }
+
     let treeSitterAnalyzer = null;
     let treeSitterReady = false;
 
-    // Initialize Tree-sitter analyzer
     async function initTreeSitter() {
         if (treeSitterReady) return true;
 
@@ -75,164 +173,165 @@ document.addEventListener('DOMContentLoaded', () => {
             treeSitterAnalyzer = new TreeSitterAnalyzer();
             await treeSitterAnalyzer.init();
             treeSitterReady = true;
-            console.log('✓ Tree-sitter C parser ready (client-side)');
+            console.log('Tree-sitter C parser ready (client-side)');
             return true;
         } catch (e) {
-            console.log('⚠ Tree-sitter not available, using JavaScript fallback');
+            console.log('Tree-sitter not available, using JavaScript fallback');
             return false;
         }
     }
 
-    // Main analysis function
+    async function analyzeWithClient(code) {
+        let analysis;
+
+        // Tree-sitter and the local tokenizer/analyzer stay within the same explicit
+        // client-side path instead of jumping to server-backed modes.
+        if (treeSitterReady || await initTreeSitter()) {
+            try {
+                analysis = await treeSitterAnalyzer.analyze(code);
+                tokenOutput.textContent = '// Analysis mode: static (Tree-sitter client-side)';
+                console.log('Analysis via Tree-sitter (client-side)');
+            } catch (e) {
+                console.log('Tree-sitter analysis failed, using JavaScript fallback:', e.message);
+                const tokens = tokenizer.tokenize(code);
+                tokenOutput.textContent = formatTokens(tokens);
+                analysis = analyzer.analyze(tokens);
+            }
+        } else {
+            const tokens = tokenizer.tokenize(code);
+            tokenOutput.textContent = formatTokens(tokens);
+            analysis = analyzer.analyze(tokens);
+        }
+
+        return analysis;
+    }
+
+    async function analyzeWithGimple(code) {
+        const response = await fetch('/analyze', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ code, mode: ANALYSIS_MODES.GIMPLE })
+        });
+
+        const result = await response.json();
+        if (!response.ok) {
+            throw new Error(result.details || result.error || 'GIMPLE analysis failed');
+        }
+
+        tokenOutput.textContent = `// Analysis mode: ${result.method || 'gcc'}\n// Source: GCC/GIMPLE via WSL`;
+        return result;
+    }
+
+    function renderAnalysis(analysis) {
+        lastAnalysis = analysis;
+        if (!analysis.variables || analysis.variables.length === 0) {
+            showPlaceholder('No variables found. Try declaring some variables with pointers.');
+            return;
+        }
+
+        hidePlaceholder();
+        renderer.render(analysis);
+        legend.classList.add('active');
+    }
+
     async function analyzeCode() {
-        const code = codeInput.value.trim();
+        const code = getCode().trim();
+        const mode = getSelectedMode();
 
         if (!code) {
             showPlaceholder('Enter some C code to visualize');
             return;
         }
 
-        analyzeBtn.disabled = true;
-        analyzeBtn.textContent = 'Analyzing...';
+        if (mode === ANALYSIS_MODES.GDB) {
+            window.debuggerUI?.startDebugSession();
+            return;
+        }
+
+        setAnalyzeButtonState(true);
 
         try {
-            let analysis;
+            const analysis = mode === ANALYSIS_MODES.GIMPLE
+                ? await analyzeWithGimple(code)
+                : await analyzeWithClient(code);
 
-            // Try Tree-sitter first (client-side, no server needed)
-            if (treeSitterReady || await initTreeSitter()) {
-                try {
-                    analysis = await treeSitterAnalyzer.analyze(code);
-                    console.log('✓ Analysis via Tree-sitter (client-side)');
-                } catch (e) {
-                    console.log('Tree-sitter analysis failed, using JavaScript fallback:', e.message);
-                    // Fall back to JavaScript analyzer
-                    const tokens = tokenizer.tokenize(code);
-                    tokenOutput.textContent = formatTokens(tokens);
-                    analysis = analyzer.analyze(tokens);
-                }
-            } else {
-                // JavaScript fallback
-                const tokens = tokenizer.tokenize(code);
-                tokenOutput.textContent = formatTokens(tokens);
-                analysis = analyzer.analyze(tokens);
-            }
+            renderAnalysis(analysis);
 
-            if (!analysis.variables || analysis.variables.length === 0) {
-                showPlaceholder('No variables found. Try declaring some variables with pointers.');
-                return;
-            }
-
-            // Render diagram
-            hidePlaceholder();
-            renderer.render(analysis);
-            legend.classList.add('active');
-
-            // Animate button
             analyzeBtn.style.transform = 'scale(0.95)';
             setTimeout(() => {
                 analyzeBtn.style.transform = '';
             }, 100);
-
         } catch (error) {
             console.error('Analysis error:', error);
             showPlaceholder('Error analyzing code: ' + error.message);
         } finally {
-            analyzeBtn.disabled = false;
-            analyzeBtn.textContent = 'Analyze';
+            setAnalyzeButtonState(false);
         }
     }
 
-    // Initialize Tree-sitter on load
-    initTreeSitter();
-
-    // Analyze button click
-    analyzeBtn.addEventListener('click', () => {
-        analyzeCode();
-    });
-
-    // Keyboard shortcut: Ctrl+Enter to analyze
-    codeInput.addEventListener('keydown', (e) => {
-        if (e.ctrlKey && e.key === 'Enter') {
-            e.preventDefault();
-            analyzeCode();
-        }
-    });
-
-    // Format tokens for debug display
     function formatTokens(tokens) {
         return tokens.map(t =>
             `[${t.line}:${t.column}] ${t.type.padEnd(12)} "${t.value}"`
         ).join('\n');
     }
 
-    // Show placeholder message
     function showPlaceholder(message) {
         placeholder.classList.remove('hidden');
         placeholder.querySelector('p').innerHTML = message;
-        diagramSvg.classList.remove('active');
+        diagramCanvas.classList.remove('active');
         legend.classList.remove('active');
     }
 
-    // Hide placeholder
     function hidePlaceholder() {
         placeholder.classList.add('hidden');
     }
 
-    // Clear button
     clearBtn.addEventListener('click', () => {
-        codeInput.value = '';
-        updateLineNumbers();
+        setCode('');
         renderer.clearDiagram();
+        lastAnalysis = null;
         showPlaceholder('Enter C code and click <strong>Analyze</strong> to visualize pointers');
         tokenOutput.textContent = '';
     });
 
-    // File upload
     fileUpload.addEventListener('change', (e) => {
         const file = e.target.files[0];
         if (file) {
             const reader = new FileReader();
             reader.onload = (event) => {
-                codeInput.value = event.target.result;
-                updateLineNumbers();
-                // Auto-analyze after upload
+                setCode(event.target.result);
                 analyzeCode();
             };
             reader.readAsText(file);
         }
-        // Reset input so same file can be uploaded again
         e.target.value = '';
     });
 
-    // Examples dropdown
     examplesDropdown.addEventListener('change', (e) => {
         const exampleKey = e.target.value;
         if (exampleKey && window.cExamples[exampleKey]) {
-            codeInput.value = window.cExamples[exampleKey].code;
-            updateLineNumbers();
+            setCode(window.cExamples[exampleKey].code);
             analyzeCode();
         }
-        // Reset dropdown
         e.target.value = '';
     });
 
-    // Debug panel toggle
     debugToggle.addEventListener('click', () => {
         debugPanel.classList.toggle('expanded');
     });
 
-    // Zoom controls
     zoomInBtn.addEventListener('click', () => renderer.zoomIn());
     zoomOutBtn.addEventListener('click', () => renderer.zoomOut());
     resetViewBtn.addEventListener('click', () => renderer.resetView());
 
-    // Resizable divider
     const divider = document.querySelector('.divider');
     const codePanel = document.querySelector('.code-panel');
     const diagramPanel = document.querySelector('.diagram-panel');
     let isResizing = false;
 
-    divider.addEventListener('mousedown', (e) => {
+    divider.addEventListener('mousedown', () => {
         isResizing = true;
         document.body.style.cursor = 'col-resize';
         document.body.style.userSelect = 'none';
@@ -244,29 +343,25 @@ document.addEventListener('DOMContentLoaded', () => {
         const container = document.querySelector('.main-content');
         const containerRect = container.getBoundingClientRect();
         const percentage = ((e.clientX - containerRect.left) / containerRect.width) * 100;
-
-        // Clamp between 20% and 80%
         const clampedPercentage = Math.min(Math.max(percentage, 20), 80);
 
         codePanel.style.flex = `0 0 ${clampedPercentage}%`;
         diagramPanel.style.flex = `0 0 ${100 - clampedPercentage}%`;
     });
 
+    function rerenderCurrentDiagram() {
+        if (lastAnalysis) {
+            renderer.render(lastAnalysis);
+        }
+        monacoEditor?.layout();
+    }
+
     document.addEventListener('mouseup', () => {
         if (isResizing) {
             isResizing = false;
             document.body.style.cursor = '';
             document.body.style.userSelect = '';
-
-            // Re-render diagram with new size
-            if (diagramSvg.classList.contains('active')) {
-                const code = codeInput.value.trim();
-                if (code) {
-                    const tokens = tokenizer.tokenize(code);
-                    const analysis = analyzer.analyze(tokens);
-                    renderer.render(analysis);
-                }
-            }
+            rerenderCurrentDiagram();
         }
     });
 
@@ -275,20 +370,20 @@ document.addEventListener('DOMContentLoaded', () => {
     window.addEventListener('resize', () => {
         clearTimeout(resizeTimeout);
         resizeTimeout = setTimeout(() => {
-            if (diagramSvg.classList.contains('active')) {
-                const code = codeInput.value.trim();
-                if (code) {
-                    const tokens = tokenizer.tokenize(code);
-                    const analysis = analyzer.analyze(tokens);
-                    renderer.render(analysis);
-                }
-            }
+            rerenderCurrentDiagram();
         }, 250);
     });
 
-    // Load default example on start
     if (window.cExamples && window.cExamples.basic) {
         codeInput.value = window.cExamples.basic.code;
-        updateLineNumbers();
     }
+
+    initTreeSitter();
+    syncModeUI();
+    analyzeBtn.addEventListener('click', () => analyzeCode());
+    visualizationMode?.addEventListener('change', syncModeUI);
+    initMonacoEditor().catch((error) => {
+        console.error('Monaco init error:', error);
+        showPlaceholder('Editor failed to initialize: ' + error.message);
+    });
 });

@@ -45,12 +45,18 @@
                     </div>
                 </div>
                 <div class="code-editor-container">
-                    <div class="line-numbers" id="line-numbers"></div>
-                    <textarea id="code-input" class="code-editor" placeholder="// Enter your C code here...
-int x = 10;
-int *p = &x;" spellcheck="false"></textarea>
+                    <div id="monaco-editor" class="monaco-editor-host"></div>
+                    <textarea id="code-input" class="code-editor-hidden" spellcheck="false"></textarea>
                 </div>
                 <div class="panel-footer">
+                    <div class="analysis-mode-group">
+                        <label for="visualization-mode" class="analysis-mode-label">Visualization Mode</label>
+                        <select id="visualization-mode" class="examples-dropdown analysis-mode-select">
+                            <option value="static">Static (Client-side)</option>
+                            <option value="gimple">Static via GCC/GIMPLE (WSL)</option>
+                            <option value="gdb">Live via GDB (WSL)</option>
+                        </select>
+                    </div>
                     <button id="analyze-btn" class="btn btn-primary">
                         <span class="btn-icon">🔍</span> Analyze
                     </button>
@@ -108,7 +114,7 @@ int *p = &x;" spellcheck="false"></textarea>
                         <div class="placeholder-icon">🎯</div>
                         <p>Enter C code and click <strong>Analyze</strong> to visualize pointers</p>
                     </div>
-                    <svg id="diagram-svg" class="diagram-svg"></svg>
+                    <div id="diagram-canvas" class="diagram-canvas"></div>
                 </div>
                 <div class="legend" id="legend">
                     <div class="legend-item">
@@ -186,6 +192,8 @@ int *p = &x;" spellcheck="false"></textarea>
     </div>
 
     <!-- Scripts -->
+    <script src="node_modules/cytoscape/dist/cytoscape.umd.js"></script>
+    <script src="node_modules/monaco-editor/min/vs/loader.js"></script>
     <!-- Tree-sitter for client-side C parsing -->
     <script src="https://unpkg.com/web-tree-sitter@0.22.6/tree-sitter.js"></script>
     <script src="tree-sitter-analyzer.js"></script>

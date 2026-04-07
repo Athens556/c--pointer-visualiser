@@ -84,19 +84,6 @@ class DebuggerUI {
             }
         });
 
-        // Breakpoint toggling
-        const lineNumbersInfo = document.getElementById('line-numbers');
-        if (lineNumbersInfo) {
-            lineNumbersInfo.style.cursor = 'pointer'; // Visual cue
-            lineNumbersInfo.addEventListener('click', (e) => {
-                if (e.target.tagName === 'SPAN' || e.target.tagName === 'DIV') {
-                    const lineNum = parseInt(e.target.innerText);
-                    if (!isNaN(lineNum)) {
-                        this.toggleBreakpoint(lineNum);
-                    }
-                }
-            });
-        }
         // Tab switching
         this.tabs.forEach(tab => {
             tab.addEventListener('click', () => {
@@ -194,6 +181,8 @@ class DebuggerUI {
 
             case 'compiled':
                 this.setStatus('🟡 Starting...', 'Starting GDB');
+                this.programOutput.textContent = '';
+                this.gdbLog.textContent = '';
                 if (msg.gimple) {
                     this.gimpleContent.textContent = msg.gimple;
                 } else {
@@ -263,10 +252,12 @@ class DebuggerUI {
                     // console output ~
                     this.gdbLog.textContent += msg.output + '\n';
                     this.gdbLog.scrollTop = this.gdbLog.scrollHeight;
+                    if (this.looksLikeProgramOutput(msg.output)) {
+                        this.appendOutput(msg.output.endsWith('\n') ? msg.output : msg.output + '\n');
+                    }
                 } else if (msg.subtype === 'target') {
                     // @ target output
-                    this.programOutput.textContent += msg.output;
-                    this.programOutput.scrollTop = this.programOutput.scrollHeight;
+                    this.appendOutput(msg.output);
                 } else if (msg.subtype === 'log') {
                     // & log output
                     this.gdbLog.textContent += '[LOG] ' + msg.output + '\n';
@@ -343,18 +334,52 @@ class DebuggerUI {
 
         this.localsTable.innerHTML = '';
 
-        for (const local of this.locals) {
+        const baseLocals = this.locals.filter(local => !local.isDerivedDereference);
+        const derivedBySource = new Map();
+
+        for (const local of this.locals.filter(local => local.isDerivedDereference)) {
+            const sourceName = local.sourceName || '';
+            if (!derivedBySource.has(sourceName)) {
+                derivedBySource.set(sourceName, []);
+            }
+            derivedBySource.get(sourceName).push(local);
+        }
+
+        const orderedLocals = [];
+        const appendWithChildren = (local) => {
+            orderedLocals.push(local);
+            const derived = derivedBySource.get(local.name) || [];
+            for (const child of derived) {
+                appendWithChildren(child);
+            }
+        };
+
+        for (const local of baseLocals) {
+            appendWithChildren(local);
+        }
+
+        for (const local of orderedLocals) {
             const row = document.createElement('tr');
 
             // Highlight pointers
             const isPointer = local.isPointer || local.type?.includes('*');
             if (isPointer) row.classList.add('pointer-var');
+            if (local.isDerivedDereference) row.classList.add('derived-var');
 
             row.innerHTML = `
                 <td class="var-name">${local.name}</td>
                 <td class="var-type">${local.type || 'unknown'}</td>
                 <td class="var-value">${local.value}</td>
             `;
+
+            if (local.isDerivedDereference) {
+                const nameCell = row.querySelector('.var-name');
+                if (nameCell) {
+                    const depth = Math.max(1, local.derivedDepth || 1);
+                    nameCell.style.paddingLeft = `${18 + (depth - 1) * 14}px`;
+                }
+            }
+
             this.localsTable.appendChild(row);
         }
     }
@@ -389,6 +414,32 @@ class DebuggerUI {
         }
     }
 
+    looksLikeProgramOutput(text) {
+        const rawText = text || '';
+        const trimmed = rawText.trim();
+        if (!trimmed) return false;
+
+        const gdbNoisePrefixes = [
+            'Reading symbols from',
+            'Breakpoint ',
+            'Using host libthread_db',
+            '[Thread debugging',
+            '[Inferior ',
+            'Warning:',
+            'Program received signal'
+        ];
+
+        if (gdbNoisePrefixes.some(prefix => trimmed.startsWith(prefix))) {
+            return false;
+        }
+
+        if (/(?:^|\n)\d+\t/.test(rawText)) return false;
+        if (/(?:^|\n)\d+\s+/.test(rawText) && rawText.includes('{')) return false;
+        if (trimmed === '(gdb)') return false;
+
+        return true;
+    }
+
     /**
      * Highlight current line in editor
      */
@@ -396,45 +447,47 @@ class DebuggerUI {
      * Highlight current line in editor
      */
     highlightLine(lineNumber) {
-        const lineNumbers = document.getElementById('line-numbers');
-        if (!lineNumbers) return;
-
-        // Remove existing highlight
-        this.clearHighlight();
-
-        // Add new highlight
-        // lineNumbers.children are <div>s (1-indexed mapping)
-        if (lineNumber > 0 && lineNumbers.children.length >= lineNumber) {
-            const el = lineNumbers.children[lineNumber - 1];
-            el.classList.add('current-line');
-            el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-        }
+        window.codeEditorBridge?.highlightLine(lineNumber);
     }
 
     /**
      * Clear line highlight
      */
     clearHighlight() {
-        const lineNumbers = document.getElementById('line-numbers');
-        if (lineNumbers) {
-            const existing = lineNumbers.querySelector('.current-line');
-            if (existing) existing.classList.remove('current-line');
-        }
+        window.codeEditorBridge?.clearHighlight();
     }
 
     /**
      * Update diagram with current variable state
      */
     updateDiagram() {
+        const toDebuggerValue = (local) => {
+            const rawValue = typeof local.value === 'string' ? local.value.trim() : String(local.value ?? '');
+
+            if (!rawValue || rawValue === '(unavailable)') {
+                return { type: 'literal', value: rawValue || '(unavailable)' };
+            }
+
+            if (rawValue === '0x0' || rawValue === 'NULL') {
+                return { type: 'null', value: 'NULL' };
+            }
+
+            return { type: 'literal', value: rawValue };
+        };
+
         // Convert GDB locals to analyzer format
         const variables = this.locals.map((local, index) => ({
             name: local.name,
-            type: local.type?.replace('*', '') || 'unknown',
-            pointerLevel: (local.type?.match(/\*/g) || []).length,
+            type: local.type === 'parameter'
+                ? (local.isPointer ? 'param' : 'parameter')
+                : (local.type?.replace('*', '') || 'unknown'),
+            pointerLevel: local.type === 'parameter'
+                ? (local.isPointer ? 1 : 0)
+                : (local.type?.match(/\*/g) || []).length,
             isArray: false,
             // Use real GDB address if available, otherwise simulate
             address: local.address || `0x${(0x1000 + index * 4).toString(16).toUpperCase()}`,
-            value: local.value
+            value: toDebuggerValue(local)
         }));
 
         // Find pointer relationships
@@ -443,12 +496,17 @@ class DebuggerUI {
             if (local.isPointer && local.value && local.value.startsWith('0x')) {
                 // Try to find what it points to
                 // Clean up value (remove extra GDB info like <main+16>)
-                let ptrValue = local.value.split(' ')[0];
+                const ptrValue = local.value.split(' ')[0];
+                const dereferencedName = local.name.startsWith('*') ? local.name : `*${local.name}`;
 
-                const pointsTo = variables.find(v =>
-                    v.address === ptrValue ||
-                    v.name === local.value.replace('&', '')
-                );
+                const pointsTo =
+                    variables.find(v => v.name === dereferencedName) ||
+                    variables.find(v =>
+                        v.name !== local.name && (
+                            v.address === ptrValue ||
+                            v.name === local.value.replace('&', '')
+                        )
+                    );
 
                 if (pointsTo) {
                     relationships.push({
@@ -500,50 +558,7 @@ class DebuggerUI {
      * Render visible breakpoints
      */
     renderBreakpoints() {
-        const lineNumbers = document.getElementById('line-numbers');
-        if (!lineNumbers) return;
-
-        // Reset all lines first (keeping highlight if present)
-        const lines = lineNumbers.children;
-        // This is tricky because existing highlighter uses text updates.
-        // We need a better way to render line numbers to support both breakpoints and highlighting.
-        // For now, let's just use DOM manipulation on the existing structure.
-
-        // Actually, app.js rebuilds line numbers on input. We should hook into that.
-        // But for static debugging (read-only while debug), we can manipulate classes.
-
-        // Let's assume the line numbers are individual elements or text lines. 
-        // app.js implementation of updateLineNumbers sets innerHTML with spans or text.
-        // Let's force a re-render of line numbers with breakpoint classes.
-
-        // Since we don't control app.js updateLineNumbers easily without refactoring,
-        // we will manually toggle a class on the line number element if it exists,
-        // or re-implement standard rendering.
-
-        // Simpler approach: Iterate through current line number elements
-        // The current app.js just sets innerHTML = numbers joined by \n.
-        // We should change app.js to render <div>s for each line to allow easy styling.
-        // But to avoid touching app.js too much, we can do this:
-
-        // If we change app.js to render spans/divs, it's robust.
-        // Let's assume we will update app.js to render <div>s for lines.
-
-        // Wait, app.js logic:
-        // const lines = codeInput.value.split('\n').length;
-        // lineNumbers.innerHTML = Array(lines).fill(0).map((_, i) => i + 1).join('\n');
-
-        // This is just text. We MUST upgrade app.js to render elements to support click & style.
-        // I will do that in the next step.
-        // Here I will implement the logic assuming they are elements.
-
-        Array.from(lineNumbers.children).forEach(el => {
-            const line = parseInt(el.textContent);
-            if (this.breakpoints.has(line)) {
-                el.classList.add('breakpoint');
-            } else {
-                el.classList.remove('breakpoint');
-            }
-        });
+        window.codeEditorBridge?.renderBreakpoints(this.breakpoints);
     }
 
 

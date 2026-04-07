@@ -185,14 +185,25 @@ function fallbackParse(code) {
  * Main analysis endpoint
  */
 app.post('/analyze', async (req, res) => {
-    const { code } = req.body;
+    const { code, mode = 'auto' } = req.body;
 
     if (!code || typeof code !== 'string') {
         return res.status(400).json({ error: 'No code provided' });
     }
 
+    if (mode === 'fallback') {
+        try {
+            const result = fallbackParse(code);
+            return res.json(result);
+        } catch (fallbackError) {
+            return res.status(500).json({
+                error: 'Fallback analysis failed',
+                details: fallbackError.message
+            });
+        }
+    }
+
     try {
-        // Try GCC analysis first
         const filePath = await writeTempFile(code);
         const gimpleOutput = await runGccAnalysis(filePath);
 
@@ -204,6 +215,13 @@ app.post('/analyze', async (req, res) => {
         res.json(result);
 
     } catch (gccError) {
+        if (mode === 'gimple') {
+            return res.status(500).json({
+                error: 'GCC/GIMPLE analysis failed',
+                details: gccError.message
+            });
+        }
+
         console.log('GCC analysis failed, using fallback:', gccError.message);
 
         // Use fallback parser
