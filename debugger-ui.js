@@ -485,6 +485,7 @@ class DebuggerUI {
                 ? (local.isPointer ? 1 : 0)
                 : (local.type?.match(/\*/g) || []).length,
             isArray: false,
+            isDerivedDereference: Boolean(local.isDerivedDereference),
             // Use real GDB address if available, otherwise simulate
             address: local.address || `0x${(0x1000 + index * 4).toString(16).toUpperCase()}`,
             value: toDebuggerValue(local)
@@ -500,13 +501,13 @@ class DebuggerUI {
                 const dereferencedName = local.name.startsWith('*') ? local.name : `*${local.name}`;
 
                 const pointsTo =
-                    variables.find(v => v.name === dereferencedName) ||
                     variables.find(v =>
                         v.name !== local.name && (
                             v.address === ptrValue ||
                             v.name === local.value.replace('&', '')
                         )
-                    );
+                    ) ||
+                    variables.find(v => v.name === dereferencedName);
 
                 if (pointsTo) {
                     relationships.push({

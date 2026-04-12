@@ -208,6 +208,16 @@ body {
     min-width: 0;
 }
 
+.monaco-editor-host .monaco-editor,
+.monaco-editor-host .monaco-editor * {
+    font-variant-ligatures: none;
+    letter-spacing: 0 !important;
+}
+
+.monaco-editor-host .monaco-editor textarea.inputarea {
+    line-height: normal !important;
+}
+
 .code-editor-hidden {
     position: absolute;
     opacity: 0;
@@ -828,23 +838,9 @@ body {
 
 /* Current execution line */
 .current-line {
-    background-color: var(--accent-purple);
-    color: white !important;
-    border-radius: 2px;
-    font-weight: bold;
-    position: relative;
-    display: block;
-    /* Ensure it takes full width of line num */
+    background-color: transparent !important;
 }
 
-.current-line::before {
-    content: '→';
-    position: absolute;
-    left: -12px;
-    color: var(--accent-purple);
-    font-weight: bold;
-    text-shadow: 0 0 2px rgba(0, 0, 0, 0.5);
-}
 
 /* Interactive Line Numbers */
 .line-numbers div {

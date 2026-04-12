@@ -27,7 +27,17 @@ class DiagramRenderer {
         this.cy = cytoscapeLib({
             container: this.container,
             elements,
-            layout: { name: 'preset' },
+            layout: {
+                name: 'cose',
+                animate: false,
+                fit: true,
+                padding: 45,
+                nodeRepulsion: 9000,
+                idealEdgeLength: 170,
+                edgeElasticity: 120,
+                gravity: 0.25,
+                numIter: 1000
+            },
             wheelSensitivity: 0.2,
             style: [
                 {
@@ -75,9 +85,10 @@ class DiagramRenderer {
 
     buildElements(analysis) {
         const analyzer = new CPointerAnalyzer();
-        const positions = this.calculatePositions(analysis.variables);
+        const variables = this.getDrawableVariables(analysis.variables || []);
+        const nodeIds = new Set(variables.map(variable => variable.name));
 
-        const nodes = analysis.variables.map(variable => {
+        const nodes = variables.map(variable => {
             const color = analyzer.getTypeColor(variable);
             const label = [
                 this.formatVarName(variable),
@@ -92,13 +103,12 @@ class DiagramRenderer {
                     label,
                     bgColor: this.hexToRgba(color, 0.18),
                     borderColor: color
-                },
-                position: positions.get(variable.name)
+                }
             };
         });
 
-        const edges = (analysis.relationships || [])
-            .filter(rel => positions.has(rel.from) && positions.has(rel.to))
+        const edges = this.buildRelationships(analysis)
+            .filter(rel => nodeIds.has(rel.from) && nodeIds.has(rel.to) && rel.from !== rel.to)
             .map((rel, index) => ({
                 data: {
                     id: `edge-${index}-${rel.from}-${rel.to}`,
@@ -111,35 +121,170 @@ class DiagramRenderer {
         return [...nodes, ...edges];
     }
 
-    calculatePositions(variables) {
-        const positions = new Map();
-        const arrays = [];
-        const pointers = [];
-        const regulars = [];
+    getDrawableVariables(variables) {
+        const ownerByAddress = new Map();
 
         for (const variable of variables) {
-            if (variable.isArrayElement || variable.isArray) {
-                arrays.push(variable);
-            } else if ((variable.pointerLevel || 0) > 0) {
-                pointers.push(variable);
-            } else {
-                regulars.push(variable);
+            if (variable.isDerivedDereference) continue;
+            const address = this.normalizeAddress(variable.address);
+            if (address) ownerByAddress.set(address, variable);
+        }
+
+        return variables.filter(variable => {
+            if (!variable.isDerivedDereference) return true;
+
+            const value = this.getRawValue(variable);
+            const isDereferencedStruct = variable.name?.startsWith('*') && value.startsWith('{');
+            if (!isDereferencedStruct) return false;
+
+            const address = this.normalizeAddress(variable.address);
+            return !address || !ownerByAddress.has(address);
+        });
+    }
+
+    buildRelationships(analysis) {
+        const variables = this.getDrawableVariables(analysis.variables || []);
+        const relationships = [...(analysis.relationships || [])];
+        const seen = new Set(relationships.map(rel => `${rel.from}->${rel.to}`));
+        const addressMap = new Map();
+
+        for (const variable of variables) {
+            const address = this.normalizeAddress(variable.address);
+            if (!address) continue;
+            if (!addressMap.has(address)) {
+                addressMap.set(address, []);
+            }
+            addressMap.get(address).push(variable);
+        }
+
+        for (const variable of variables) {
+            const pointerValue = this.getPointerValue(variable);
+            if (!pointerValue) continue;
+
+            const candidates = (addressMap.get(pointerValue) || [])
+                .filter(candidate => candidate.name !== variable.name)
+                .sort((a, b) => this.targetPriority(a) - this.targetPriority(b));
+
+            const target = candidates[0];
+            if (!target) continue;
+
+            const key = `${variable.name}->${target.name}`;
+            if (seen.has(key)) continue;
+
+            relationships.push({
+                from: variable.name,
+                to: target.name,
+                type: 'points_to',
+                label: pointerValue
+            });
+            seen.add(key);
+        }
+
+        for (const variable of variables) {
+            const fields = this.parseStructFields(this.getRawValue(variable));
+            for (const field of fields) {
+                const pointerValue = this.normalizeAddress(field.value);
+                if (!pointerValue) continue;
+
+                const candidates = (addressMap.get(pointerValue) || [])
+                    .filter(candidate => candidate.name !== variable.name)
+                    .sort((a, b) => this.targetPriority(a) - this.targetPriority(b));
+
+                const target = candidates[0];
+                if (!target) continue;
+
+                const key = `${variable.name}->${target.name}`;
+                if (seen.has(key)) continue;
+
+                relationships.push({
+                    from: variable.name,
+                    to: target.name,
+                    type: 'field_points_to',
+                    label: `${field.name}: ${pointerValue}`
+                });
+                seen.add(key);
             }
         }
 
-        arrays.forEach((variable, index) => {
-            positions.set(variable.name, { x: 180 + index * 190, y: 110 });
-        });
+        return relationships;
+    }
 
-        pointers.forEach((variable, index) => {
-            positions.set(variable.name, { x: 180, y: 250 + index * 135 });
-        });
+    getPointerValue(variable) {
+        if ((variable.pointerLevel || 0) <= 0 && !variable.isPointer) {
+            return null;
+        }
 
-        regulars.forEach((variable, index) => {
-            positions.set(variable.name, { x: 560, y: 250 + index * 135 });
-        });
+        const value = variable.value;
+        if (value?.type === 'literal') {
+            return this.normalizeAddress(value.value);
+        }
+        if (value?.type === 'address_of') {
+            return null;
+        }
+        if (typeof value === 'string') {
+            return this.normalizeAddress(value);
+        }
 
-        return positions;
+        return null;
+    }
+
+    getRawValue(variable) {
+        const value = variable?.value;
+        if (value?.type === 'literal') {
+            return String(value.value ?? '').trim();
+        }
+        if (value?.type === 'null') {
+            return '0x0';
+        }
+        return String(value ?? '').trim();
+    }
+
+    parseStructFields(structValue) {
+        const trimmed = (structValue || '').trim();
+        if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return [];
+
+        const inner = trimmed.slice(1, -1);
+        const fields = [];
+        let current = '';
+        let braceDepth = 0;
+
+        for (let i = 0; i < inner.length; i++) {
+            const ch = inner[i];
+            if (ch === '{') braceDepth++;
+            if (ch === '}') braceDepth--;
+
+            if (ch === ',' && braceDepth === 0) {
+                if (current.trim()) fields.push(current.trim());
+                current = '';
+                continue;
+            }
+
+            current += ch;
+        }
+
+        if (current.trim()) fields.push(current.trim());
+
+        return fields.map((field) => {
+            const parts = field.split(/\s*=\s*/);
+            return {
+                name: parts[0]?.trim(),
+                value: parts.slice(1).join(' = ').trim()
+            };
+        }).filter(field => field.name);
+    }
+
+    normalizeAddress(value) {
+        if (!value || typeof value !== 'string') return null;
+        const trimmed = value.trim();
+        if (!trimmed.startsWith('0x')) return null;
+        if (trimmed === '0x0') return null;
+        return trimmed.split(/\s+/)[0];
+    }
+
+    targetPriority(variable) {
+        if (!variable.isDerivedDereference) return 0;
+        if (!variable.name?.startsWith('*')) return 1;
+        return 2;
     }
 
     formatVarName(variable) {

@@ -137,10 +137,20 @@ document.addEventListener('DOMContentLoaded', () => {
             scrollBeyondLastLine: false,
             tabSize: 4,
             insertSpaces: true,
-            fontFamily: 'JetBrains Mono',
+            fontFamily: 'Consolas, "Courier New", monospace',
             fontSize: 14,
-            lineHeight: 24
+            lineHeight: 24,
+            letterSpacing: 0,
+            fontLigatures: false,
+            fontVariations: false
         });
+
+        if (document.fonts?.ready) {
+            document.fonts.ready.then(() => {
+                monaco.editor.remeasureFonts();
+                monacoEditor?.layout();
+            });
+        }
 
         monacoEditor.onDidChangeModelContent(() => {
             codeInput.value = monacoEditor.getValue();

@@ -194,6 +194,7 @@ class GDBController extends EventEmitter {
             const locals = this.parseLocals(res.locals);
             const args = await this.getFrameArguments();
             const variables = this.mergeVariables(args, locals);
+            await this.hydrateStructValues(variables);
             const chainVariables = await this.buildStructChainVariables(variables);
             const expandedVariables = this.mergeVariables(variables, chainVariables);
             const dereferencedVariables = await this.buildDereferencedVariables(expandedVariables);
@@ -611,6 +612,18 @@ class GDBController extends EventEmitter {
         }
 
         return derived;
+    }
+
+    async hydrateStructValues(variables) {
+        for (const variable of variables) {
+            if (!variable.type?.includes('struct')) continue;
+            if (variable.value && variable.value !== '(unavailable)') continue;
+
+            const value = await this.safeEvaluate(variable.name);
+            if (value) {
+                variable.value = value;
+            }
+        }
     }
 
     async buildStructChainVariables(variables) {
