@@ -173,47 +173,10 @@ document.addEventListener('DOMContentLoaded', () => {
         window.debuggerUI?.renderBreakpoints();
     }
 
-    let treeSitterAnalyzer = null;
-    let treeSitterReady = false;
-
-    async function initTreeSitter() {
-        if (treeSitterReady) return true;
-
-        try {
-            treeSitterAnalyzer = new TreeSitterAnalyzer();
-            await treeSitterAnalyzer.init();
-            treeSitterReady = true;
-            console.log('Tree-sitter C parser ready (client-side)');
-            return true;
-        } catch (e) {
-            console.log('Tree-sitter not available, using JavaScript fallback');
-            return false;
-        }
-    }
-
     async function analyzeWithClient(code) {
-        let analysis;
-
-        // Tree-sitter and the local tokenizer/analyzer stay within the same explicit
-        // client-side path instead of jumping to server-backed modes.
-        if (treeSitterReady || await initTreeSitter()) {
-            try {
-                analysis = await treeSitterAnalyzer.analyze(code);
-                tokenOutput.textContent = '// Analysis mode: static (Tree-sitter client-side)';
-                console.log('Analysis via Tree-sitter (client-side)');
-            } catch (e) {
-                console.log('Tree-sitter analysis failed, using JavaScript fallback:', e.message);
-                const tokens = tokenizer.tokenize(code);
-                tokenOutput.textContent = formatTokens(tokens);
-                analysis = analyzer.analyze(tokens);
-            }
-        } else {
-            const tokens = tokenizer.tokenize(code);
-            tokenOutput.textContent = formatTokens(tokens);
-            analysis = analyzer.analyze(tokens);
-        }
-
-        return analysis;
+        const tokens = tokenizer.tokenize(code);
+        tokenOutput.textContent = formatTokens(tokens);
+        return analyzer.analyze(tokens);
     }
 
     async function analyzeWithGimple(code) {
@@ -388,7 +351,6 @@ document.addEventListener('DOMContentLoaded', () => {
         codeInput.value = window.cExamples.basic.code;
     }
 
-    initTreeSitter();
     syncModeUI();
     analyzeBtn.addEventListener('click', () => analyzeCode());
     visualizationMode?.addEventListener('change', syncModeUI);
